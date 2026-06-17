@@ -11,6 +11,9 @@ class YouTubeTrack:
     webpage_url: str
     stream_url: str
     duration: int | None
+    thumbnail_url: str | None
+    uploader: str | None
+    source: str
 
 
 class YouTubeService:
@@ -69,4 +72,7 @@ class YouTubeService:
             webpage_url=webpage_url,
             stream_url=stream_url,
             duration=info.get("duration"),
+            thumbnail_url=info.get("thumbnail"),
+            uploader=info.get("uploader") or info.get("channel"),
+            source=info.get("extractor_key") or "YouTube",
         )

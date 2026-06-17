@@ -1,65 +1,212 @@
-import asyncio
 import logging
+import math
 import shutil
-from collections import deque
-from concurrent.futures import Future
-from dataclasses import dataclass, field
 from typing import cast
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot.services.youtube import YouTubeService, YouTubeTrack
-
-
-MAX_QUEUE_SIZE = 50
-
-FFMPEG_BEFORE_OPTIONS = (
-    "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 "
-    "-reconnect_on_network_error 1 -reconnect_delay_max 5"
+from bot.services.music_player import (
+    MAX_QUEUE_SIZE,
+    LoopMode,
+    MusicPlayerService,
+    QueueFullError,
 )
-FFMPEG_OPTIONS = "-vn"
+from bot.services.youtube import YouTubeService
+from bot.utils.embeds import error_embed, info_embed, success_embed
+from bot.utils.time import format_duration
+
+
+QUEUE_PAGE_SIZE = 10
+PROGRESS_BAR_WIDTH = 18
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(slots=True)
-class QueuedTrack:
-    track: YouTubeTrack
-    requester: discord.Member
-
-
-@dataclass(slots=True)
-class GuildMusicState:
-    queue: deque[QueuedTrack] = field(default_factory=deque)
-    current: QueuedTrack | None = None
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    suppress_next_after: bool = False
 
 
 class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.youtube = YouTubeService()
-        self._states: dict[int, GuildMusicState] = {}
-
-    def _get_state(self, guild_id: int) -> GuildMusicState:
-        if guild_id not in self._states:
-            self._states[guild_id] = GuildMusicState()
-        return self._states[guild_id]
+        self.player = MusicPlayerService(
+            bot,
+            self.youtube,
+            self._refresh_or_create_player_message,
+        )
 
     async def _send_guild_only_error(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(
-            "Lenh nay chi dung duoc trong server.",
+        await self._send_interaction_embed(
+            interaction,
+            error_embed("Lenh nay chi dung duoc trong server."),
             ephemeral=True,
         )
 
-    def _get_voice_client(self, guild: discord.Guild) -> discord.VoiceClient | None:
-        return cast(discord.VoiceClient | None, guild.voice_client)
-
     def _ffmpeg_is_available(self) -> bool:
         return shutil.which("ffmpeg") is not None
+
+    def _create_player_view(self, guild_id: int) -> discord.ui.View:
+        from bot.views.music_player import MusicPlayerView
+
+        state = self.player.get_state(guild_id)
+        guild = self.bot.get_guild(guild_id)
+        voice_client = self.player.get_voice_client(guild) if guild is not None else None
+        is_paused = voice_client.is_paused() if voice_client is not None else False
+
+        return MusicPlayerView(
+            self,
+            guild_id,
+            loop_mode=state.loop_mode,
+            is_paused=is_paused,
+            has_current=state.current is not None,
+            queue_size=len(state.queue),
+        )
+
+    def _create_queue_view(self, guild_id: int, page: int = 0) -> discord.ui.View:
+        from bot.views.music_queue import MusicQueueView
+
+        return MusicQueueView(self, guild_id, page)
+
+    def _build_player_embed(self, guild: discord.Guild) -> discord.Embed:
+        state = self.player.get_state(guild.id)
+        current = state.current
+
+        if current is None:
+            title = "Máy phát nhạc đã dừng" if state.stopped else "Máy phát nhạc đang trống"
+            description = "Không có bài nào đang phát."
+            if state.queue:
+                description = "Đang chuẩn bị phát bài tiếp theo."
+
+            embed = discord.Embed(
+                title=title,
+                description=description,
+                color=discord.Color.dark_gray(),
+            )
+            embed.add_field(name="Queue", value=f"{len(state.queue)} bai", inline=True)
+            embed.add_field(name="Loop", value=state.loop_mode, inline=True)
+            embed.add_field(name="Volume", value=f"{int(state.volume * 100)}%", inline=True)
+            embed.add_field(
+                name="Kết nối",
+                value=self._format_voice_status(state.voice_status),
+                inline=True,
+            )
+            if state.last_error:
+                embed.add_field(name="Thông báo", value=state.last_error[:900], inline=False)
+            embed.set_footer(text=f"{guild.name} • Máy phát nhạc")
+            return embed
+
+        voice_client = self.player.get_voice_client(guild)
+        if state.voice_status == "reconnecting":
+            status = "Đang kết nối lại"
+            color = discord.Color.orange()
+        elif state.voice_status == "disconnected":
+            status = "Mất kết nối"
+            color = discord.Color.red()
+        elif voice_client is not None and voice_client.is_paused():
+            status = "Paused"
+            color = discord.Color.gold()
+        else:
+            status = "Playing"
+            color = discord.Color.blurple()
+
+        track = current.track
+        artist = f"{track.uploader}\n" if track.uploader else ""
+        embed = discord.Embed(
+            title=f"Máy phát nhạc • {status}",
+            description=f"{artist}**[{track.title}]({track.webpage_url})**",
+            color=color,
+        )
+        embed.add_field(
+            name="Progress",
+            value=self._format_progress(guild.id, track.duration),
+            inline=False,
+        )
+        embed.add_field(name="Requested by", value=current.requester.mention, inline=True)
+        embed.add_field(name="Volume", value=f"{int(state.volume * 100)}%", inline=True)
+        embed.add_field(name="Loop", value=state.loop_mode, inline=True)
+        embed.add_field(name="Queue", value=f"{len(state.queue)} bai", inline=True)
+        embed.add_field(name="Source", value=track.source or "YouTube", inline=True)
+        embed.add_field(
+            name="Kết nối",
+            value=self._format_voice_status(state.voice_status),
+            inline=True,
+        )
+        embed.add_field(
+            name="Duration",
+            value=format_duration(track.duration),
+            inline=True,
+        )
+        if state.last_error:
+            embed.add_field(name="Thông báo", value=state.last_error[:900], inline=False)
+        if track.thumbnail_url:
+            embed.set_image(url=track.thumbnail_url)
+        embed.set_footer(
+            text=f"{track.source or 'YouTube'} • Máy phát nhạc của {current.requester.display_name}"
+        )
+        return embed
+
+    def _format_voice_status(self, voice_status: str) -> str:
+        if voice_status == "reconnecting":
+            return "Đang kết nối lại..."
+        if voice_status == "disconnected":
+            return "Đã mất kết nối"
+        return "Đang kết nối"
+
+    def _format_progress(self, guild_id: int, duration: int | None) -> str:
+        elapsed = self.player.get_elapsed_seconds(guild_id)
+        if duration is None or duration <= 0:
+            return f"{format_duration(elapsed)} ━━━━━━━━━━━━━━━━━━ live"
+
+        elapsed = min(elapsed, duration)
+        ratio = elapsed / duration
+        filled = min(PROGRESS_BAR_WIDTH - 1, max(0, int(ratio * PROGRESS_BAR_WIDTH)))
+        bar = "━" * filled + "●" + "─" * (PROGRESS_BAR_WIDTH - filled - 1)
+        return f"{format_duration(elapsed)} {bar} {format_duration(duration)}"
+
+    def build_queue_embed(self, guild_id: int, page: int = 0) -> discord.Embed:
+        guild = self.bot.get_guild(guild_id)
+        state = self.player.get_state(guild_id)
+        total_pages = self.get_queue_total_pages(guild_id)
+        page = min(max(page, 0), total_pages - 1)
+        start = page * QUEUE_PAGE_SIZE
+        upcoming = list(state.queue)
+        page_tracks = upcoming[start : start + QUEUE_PAGE_SIZE]
+
+        title = f"Queue của {guild.name}" if guild is not None else "Queue máy phát nhạc"
+        embed = discord.Embed(title=title, color=discord.Color.blurple())
+
+        if state.current is not None:
+            current = state.current
+            embed.add_field(
+                name="Dang phat",
+                value=(
+                    f"**[{current.track.title}]({current.track.webpage_url})**\n"
+                    f"Yeu cau boi {current.requester.mention}"
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(name="Dang phat", value="Khong co bai nao.", inline=False)
+
+        if not page_tracks:
+            embed.description = "Queue dang trong."
+        else:
+            lines = []
+            for offset, queued_track in enumerate(page_tracks, start=start + 1):
+                duration = format_duration(queued_track.track.duration)
+                lines.append(
+                    f"`{offset:02d}.` **[{queued_track.track.title}]({queued_track.track.webpage_url})** "
+                    f"`{duration}` - {queued_track.requester.mention}"
+                )
+            embed.description = "\n".join(lines)
+
+        embed.set_footer(
+            text=f"Page {page + 1}/{total_pages} • {len(upcoming)} bai trong queue"
+        )
+        return embed
+
+    def get_queue_total_pages(self, guild_id: int) -> int:
+        state = self.player.get_state(guild_id)
+        return max(1, math.ceil(len(state.queue) / QUEUE_PAGE_SIZE))
 
     async def _ensure_voice(
         self,
@@ -71,13 +218,16 @@ class MusicCog(commands.Cog):
 
         if member.voice is None or member.voice.channel is None:
             await interaction.followup.send(
-                "Ban can vao voice channel truoc khi phat nhac.",
+                embed=error_embed(
+                    "Ban can vao voice channel truoc.",
+                    "Hay vao mot voice channel roi dung lai lenh /play.",
+                ),
                 ephemeral=True,
             )
             return None
 
         voice_channel = member.voice.channel
-        voice_client = self._get_voice_client(interaction.guild)
+        voice_client = self.player.get_voice_client(interaction.guild)
 
         try:
             if voice_client is None:
@@ -89,96 +239,277 @@ class MusicCog(commands.Cog):
             return voice_client
         except discord.ClientException:
             await interaction.followup.send(
-                "Bot khong the ket noi voice channel.",
+                embed=error_embed("Bot khong the ket noi voice channel."),
                 ephemeral=True,
             )
         except discord.Forbidden:
             await interaction.followup.send(
-                "Bot khong co quyen vao voice channel nay.",
+                embed=error_embed("Bot khong co quyen vao voice channel nay."),
                 ephemeral=True,
             )
         except discord.DiscordException:
             await interaction.followup.send(
-                "Co loi khi ket noi voice channel.",
+                embed=error_embed("Co loi khi ket noi voice channel."),
                 ephemeral=True,
             )
 
         return None
 
-    async def _create_audio_source(self, track: YouTubeTrack) -> discord.FFmpegOpusAudio:
-        return await discord.FFmpegOpusAudio.from_probe(
-            track.stream_url,
-            method="fallback",
-            before_options=FFMPEG_BEFORE_OPTIONS,
-            options=FFMPEG_OPTIONS,
+    async def _refresh_or_create_player_message(self, guild_id: int) -> None:
+        state = self.player.get_state(guild_id)
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return
+
+        embed = self._build_player_embed(guild)
+        view = self._create_player_view(guild_id)
+
+        if state.player_message_id is not None and state.player_channel_id is not None:
+            channel = self.bot.get_channel(state.player_channel_id)
+            if isinstance(channel, discord.abc.Messageable):
+                try:
+                    message = await channel.fetch_message(state.player_message_id)  # type: ignore[attr-defined]
+                    await message.edit(embed=embed, view=view)
+                    return
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    state.player_message_id = None
+                    state.player_channel_id = None
+                except Exception:
+                    logger.exception("Failed to update player message")
+                    return
+
+        if state.last_text_channel_id is None:
+            return
+
+        channel = self.bot.get_channel(state.last_text_channel_id)
+        if not isinstance(channel, discord.abc.Messageable):
+            return
+
+        try:
+            message = await channel.send(embed=embed, view=view)
+        except discord.HTTPException:
+            logger.exception("Failed to create player message")
+            return
+
+        state.player_message_id = message.id
+        state.player_channel_id = message.channel.id
+
+    async def _send_player_message_from_interaction(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        state = self.player.get_state(interaction.guild.id)
+        state.last_text_channel_id = interaction.channel_id
+        embed = self._build_player_embed(interaction.guild)
+        view = self._create_player_view(interaction.guild.id)
+
+        if interaction.response.is_done():
+            message = await interaction.followup.send(embed=embed, view=view)
+        else:
+            await interaction.response.send_message(embed=embed, view=view)
+            message = await interaction.original_response()
+
+        state.player_message_id = message.id
+        state.player_channel_id = message.channel.id
+
+    async def can_use_player_control(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+    ) -> bool:
+        if interaction.guild is None:
+            return False
+
+        permissions = member.guild_permissions
+        if permissions.manage_guild or permissions.administrator:
+            return True
+
+        voice_client = self.player.get_voice_client(interaction.guild)
+        if voice_client is None or voice_client.channel is None:
+            return member.voice is not None and member.voice.channel is not None
+
+        return member.voice is not None and member.voice.channel == voice_client.channel
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if self.bot.user is None or member.id != self.bot.user.id:
+            return
+
+        await self.player.handle_bot_voice_state_update(
+            member.guild.id,
+            before,
+            after,
         )
 
-    async def _play_next(self, guild_id: int) -> bool:
-        state = self._get_state(guild_id)
+    async def _send_control_denied(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member):
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Khong xac dinh duoc thanh vien trong server."),
+                ephemeral=True,
+            )
+            return True
 
-        while True:
-            async with state.lock:
-                if state.suppress_next_after:
-                    state.suppress_next_after = False
-                    state.current = None
-                    return False
+        if not await self.can_use_player_control(interaction, interaction.user):
+            await self._send_interaction_embed(
+                interaction,
+                error_embed(
+                    "Ban khong the dieu khien máy phát nhạc.",
+                    "Hay vao cung voice channel voi bot hoac can quyen quan ly server.",
+                ),
+                ephemeral=True,
+            )
+            return True
 
-                guild = self.bot.get_guild(guild_id)
-                if guild is None:
-                    state.current = None
-                    return False
+        return False
 
-                voice_client = self._get_voice_client(guild)
-                if voice_client is None or not voice_client.is_connected():
-                    state.current = None
-                    return False
+    async def _send_interaction_embed(
+        self,
+        interaction: discord.Interaction,
+        embed: discord.Embed,
+        *,
+        ephemeral: bool = False,
+    ) -> None:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
 
-                if voice_client.is_playing() or voice_client.is_paused():
-                    return False
+    async def skip_from_interaction(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
 
-                if not state.queue:
-                    state.current = None
-                    return False
+        skipped = await self.player.skip(interaction.guild.id)
+        if not skipped:
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Khong co bai nao dang phat."),
+                ephemeral=True,
+            )
+            return
 
-                queued_track = state.queue.popleft()
-                state.current = queued_track
+        await self._send_interaction_embed(
+            interaction,
+            success_embed("Da skip bai hien tai."),
+            ephemeral=True,
+        )
 
-            refreshed_track = await self.youtube.refresh(queued_track.track)
-            if refreshed_track is not None:
-                queued_track.track.stream_url = refreshed_track.stream_url
+    async def toggle_pause_from_interaction(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
 
-            try:
-                source = await self._create_audio_source(queued_track.track)
-            except Exception:
-                logger.exception("Failed to create FFmpeg audio source")
-                async with state.lock:
-                    state.current = None
-                continue
+        result = await self.player.toggle_pause(interaction.guild.id)
+        messages = {
+            "paused": success_embed("Da pause máy phát nhạc."),
+            "resumed": success_embed("Da resume máy phát nhạc."),
+            "missing": error_embed("Bot chua o voice channel."),
+            "idle": error_embed("Khong co bai nao dang phat."),
+        }
+        await self._send_interaction_embed(
+            interaction,
+            messages[result],
+            ephemeral=True,
+        )
 
-            def after_play(error: Exception | None) -> None:
-                if error:
-                    logger.warning("Audio player error: %s", error)
+    async def stop_from_interaction(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
 
-                future = asyncio.run_coroutine_threadsafe(
-                    self._play_next(guild_id),
-                    self.bot.loop,
-                )
-                future.add_done_callback(self._log_after_error)
+        await self.player.stop(interaction.guild.id)
+        await self._send_interaction_embed(
+            interaction,
+            success_embed("Da stop va xoa queue."),
+            ephemeral=True,
+        )
 
-            try:
-                voice_client.play(source, after=after_play)
-                return True
-            except discord.ClientException:
-                logger.exception("Failed to start audio playback")
-                async with state.lock:
-                    state.current = None
-                continue
+    async def send_queue_from_interaction(
+        self,
+        interaction: discord.Interaction,
+        *,
+        ephemeral: bool = False,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
 
-    def _log_after_error(self, future: Future[bool]) -> None:
-        try:
-            future.result()
-        except Exception:
-            logger.exception("Error while playing next track")
+        embed = self.build_queue_embed(interaction.guild.id)
+        view = self._create_queue_view(interaction.guild.id)
+        await self._send_queue_response(interaction, embed, view, ephemeral=ephemeral)
+
+    async def _send_queue_response(
+        self,
+        interaction: discord.Interaction,
+        embed: discord.Embed,
+        view: discord.ui.View,
+        *,
+        ephemeral: bool,
+    ) -> None:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, view=view, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=ephemeral)
+
+    async def refresh_player_from_interaction(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        await self._refresh_or_create_player_message(interaction.guild.id)
+        await self._send_interaction_embed(
+            interaction,
+            info_embed("Máy phát nhạc đã được cập nhật."),
+            ephemeral=True,
+        )
+
+    async def shuffle_from_interaction(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        shuffled = await self.player.shuffle(interaction.guild.id)
+        if not shuffled:
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Can it nhat 2 bai trong queue de shuffle."),
+                ephemeral=True,
+            )
+            return
+
+        await self._send_interaction_embed(
+            interaction,
+            success_embed("Da shuffle queue."),
+            ephemeral=True,
+        )
+
+    async def set_loop_from_interaction(
+        self,
+        interaction: discord.Interaction,
+        loop_mode: LoopMode,
+        *,
+        ephemeral: bool = True,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        await self.player.set_loop(interaction.guild.id, loop_mode)
+        await self._send_interaction_embed(
+            interaction,
+            success_embed("Da cap nhat loop.", f"Loop mode: **{loop_mode}**"),
+            ephemeral=ephemeral,
+        )
 
     @app_commands.command(name="play", description="Phat nhac tu YouTube link hoac tu khoa")
     @app_commands.describe(query="YouTube link hoac tu khoa can tim")
@@ -191,24 +522,29 @@ class MusicCog(commands.Cog):
 
         if not isinstance(interaction.user, discord.Member):
             await interaction.followup.send(
-                "Khong xac dinh duoc thanh vien trong server.",
+                embed=error_embed("Khong xac dinh duoc thanh vien trong server."),
                 ephemeral=True,
             )
             return
 
         if not self._ffmpeg_is_available():
             await interaction.followup.send(
-                "Khong tim thay FFmpeg. Hay cai FFmpeg va them vao PATH.",
+                embed=error_embed(
+                    "Khong tim thay FFmpeg.",
+                    "Hay cai FFmpeg va them vao PATH truoc khi dung /play.",
+                ),
                 ephemeral=True,
             )
             return
 
-        state = self._get_state(interaction.guild.id)
-
+        state = self.player.get_state(interaction.guild.id)
         async with state.lock:
             if len(state.queue) >= MAX_QUEUE_SIZE:
                 await interaction.followup.send(
-                    f"Queue da day ({MAX_QUEUE_SIZE} bai). Hay doi bot phat bot hoac dung /skip.",
+                    embed=error_embed(
+                        "Queue da day.",
+                        f"Gioi han hien tai la {MAX_QUEUE_SIZE} bai.",
+                    ),
                     ephemeral=True,
                 )
                 return
@@ -216,7 +552,10 @@ class MusicCog(commands.Cog):
         track = await self.youtube.search(query)
         if track is None:
             await interaction.followup.send(
-                "Khong lay duoc audio tu link hoac tu khoa nay.",
+                embed=error_embed(
+                    "Khong tim thay bai hat.",
+                    "Thu tu khoa khac hoac gui link YouTube truc tiep.",
+                ),
                 ephemeral=True,
             )
             return
@@ -225,39 +564,57 @@ class MusicCog(commands.Cog):
         if voice_client is None:
             return
 
-        queued_track = QueuedTrack(track=track, requester=interaction.user)
+        try:
+            queued_track, was_idle = await self.player.add_track(
+                interaction.guild,
+                voice_client,
+                track,
+                interaction.user,
+                interaction.channel_id,
+            )
+        except QueueFullError as exc:
+            await interaction.followup.send(
+                embed=error_embed(
+                    "Queue da day.",
+                    f"Gioi han hien tai la {exc.max_size} bai.",
+                ),
+                ephemeral=True,
+            )
+            return
 
-        async with state.lock:
-            if state.current is not None and len(state.queue) >= MAX_QUEUE_SIZE:
+        if was_idle:
+            state = self.player.get_state(interaction.guild.id)
+            if state.current is None:
                 await interaction.followup.send(
-                    f"Queue da day ({MAX_QUEUE_SIZE} bai). Hay doi bot phat bot hoac dung /skip.",
+                    embed=error_embed(
+                        "Khong the bat dau phat bai nay.",
+                        "Hay kiem tra FFmpeg, mang, hoac thu mot bai khac.",
+                    ),
                     ephemeral=True,
                 )
                 return
 
-            was_idle = (
-                state.current is None
-                and not voice_client.is_playing()
-                and not voice_client.is_paused()
-            )
-            state.queue.append(queued_track)
-            state.suppress_next_after = False
-
-        if was_idle:
-            started = await self._play_next(interaction.guild.id)
-            if started:
-                await interaction.followup.send(
-                    f"Dang phat: **{track.title}**\n{track.webpage_url}"
-                )
+            if state.player_message_id is None:
+                await self._send_player_message_from_interaction(interaction)
             else:
                 await interaction.followup.send(
-                    "Khong the bat dau phat bai nay. Hay kiem tra FFmpeg hoac thu bai khac.",
+                    embed=success_embed(
+                        "Máy phát nhạc đã bắt đầu.",
+                        f"**[{queued_track.track.title}]({queued_track.track.webpage_url})**",
+                    ),
                     ephemeral=True,
                 )
-        else:
-            await interaction.followup.send(
-                f"Da them vao queue: **{track.title}**\nVi tri: {len(state.queue)}"
+            return
+
+        state = self.player.get_state(interaction.guild.id)
+        await interaction.followup.send(
+            embed=success_embed(
+                "Da them vao queue.",
+                f"**[{queued_track.track.title}]({queued_track.track.webpage_url})**\n"
+                f"Vi tri: **{len(state.queue)}**",
             )
+        )
+        await self._refresh_or_create_player_message(interaction.guild.id)
 
     @app_commands.command(name="skip", description="Bo qua bai hien tai")
     async def skip(self, interaction: discord.Interaction) -> None:
@@ -265,23 +622,10 @@ class MusicCog(commands.Cog):
             await self._send_guild_only_error(interaction)
             return
 
-        voice_client = self._get_voice_client(interaction.guild)
-        if voice_client is None or not voice_client.is_connected():
-            await interaction.response.send_message(
-                "Bot chua o voice channel.",
-                ephemeral=True,
-            )
+        if await self._send_control_denied(interaction):
             return
 
-        if not voice_client.is_playing() and not voice_client.is_paused():
-            await interaction.response.send_message(
-                "Khong co bai nao dang phat.",
-                ephemeral=True,
-            )
-            return
-
-        voice_client.stop()
-        await interaction.response.send_message("Da skip bai hien tai.")
+        await self.skip_from_interaction(interaction)
 
     @app_commands.command(name="pause", description="Tam dung bai hien tai")
     async def pause(self, interaction: discord.Interaction) -> None:
@@ -289,16 +633,23 @@ class MusicCog(commands.Cog):
             await self._send_guild_only_error(interaction)
             return
 
-        voice_client = self._get_voice_client(interaction.guild)
-        if voice_client is None or not voice_client.is_playing():
-            await interaction.response.send_message(
-                "Khong co bai nao dang phat de pause.",
+        if await self._send_control_denied(interaction):
+            return
+
+        paused = await self.player.pause(interaction.guild.id)
+        if not paused:
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Khong co bai nao dang phat de pause."),
                 ephemeral=True,
             )
             return
 
-        voice_client.pause()
-        await interaction.response.send_message("Da pause.")
+        await self._send_interaction_embed(
+            interaction,
+            success_embed("Da pause máy phát nhạc."),
+            ephemeral=True,
+        )
 
     @app_commands.command(name="resume", description="Tiep tuc phat nhac")
     async def resume(self, interaction: discord.Interaction) -> None:
@@ -306,16 +657,23 @@ class MusicCog(commands.Cog):
             await self._send_guild_only_error(interaction)
             return
 
-        voice_client = self._get_voice_client(interaction.guild)
-        if voice_client is None or not voice_client.is_paused():
-            await interaction.response.send_message(
-                "Khong co bai nao dang pause.",
+        if await self._send_control_denied(interaction):
+            return
+
+        resumed = await self.player.resume(interaction.guild.id)
+        if not resumed:
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Khong co bai nao dang pause."),
                 ephemeral=True,
             )
             return
 
-        voice_client.resume()
-        await interaction.response.send_message("Da resume.")
+        await self._send_interaction_embed(
+            interaction,
+            success_embed("Da resume máy phát nhạc."),
+            ephemeral=True,
+        )
 
     @app_commands.command(name="stop", description="Dung nhac va xoa queue")
     async def stop(self, interaction: discord.Interaction) -> None:
@@ -323,20 +681,10 @@ class MusicCog(commands.Cog):
             await self._send_guild_only_error(interaction)
             return
 
-        state = self._get_state(interaction.guild.id)
-        voice_client = self._get_voice_client(interaction.guild)
+        if await self._send_control_denied(interaction):
+            return
 
-        async with state.lock:
-            state.queue.clear()
-            state.current = None
-            state.suppress_next_after = True
-
-        if voice_client is not None and (
-            voice_client.is_playing() or voice_client.is_paused()
-        ):
-            voice_client.stop()
-
-        await interaction.response.send_message("Da stop va xoa queue.")
+        await self.stop_from_interaction(interaction)
 
     @app_commands.command(name="leave", description="Bot roi khoi voice channel")
     async def leave(self, interaction: discord.Interaction) -> None:
@@ -344,26 +692,20 @@ class MusicCog(commands.Cog):
             await self._send_guild_only_error(interaction)
             return
 
-        state = self._get_state(interaction.guild.id)
-        voice_client = self._get_voice_client(interaction.guild)
-
-        if voice_client is None or not voice_client.is_connected():
-            await interaction.response.send_message(
-                "Bot chua o voice channel.",
+        left = await self.player.leave(interaction.guild.id)
+        if not left:
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Bot chua o voice channel."),
                 ephemeral=True,
             )
             return
 
-        async with state.lock:
-            state.queue.clear()
-            state.current = None
-            state.suppress_next_after = True
-
-        if voice_client.is_playing() or voice_client.is_paused():
-            voice_client.stop()
-
-        await voice_client.disconnect()
-        await interaction.response.send_message("Da roi khoi voice channel.")
+        await self._send_interaction_embed(
+            interaction,
+            success_embed("Da roi khoi voice channel."),
+            ephemeral=True,
+        )
 
     @app_commands.command(name="queue", description="Xem queue hien tai")
     async def queue(self, interaction: discord.Interaction) -> None:
@@ -371,35 +713,129 @@ class MusicCog(commands.Cog):
             await self._send_guild_only_error(interaction)
             return
 
-        state = self._get_state(interaction.guild.id)
+        await self.send_queue_from_interaction(interaction)
 
-        current = state.current
-        upcoming = list(state.queue)
+    @app_commands.command(name="nowplaying", description="Xem máy phát nhạc hien tai")
+    async def nowplaying(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
 
-        if current is None and not upcoming:
-            await interaction.response.send_message(
-                "Queue dang trong.",
+        state = self.player.get_state(interaction.guild.id)
+        if state.player_message_id is None:
+            await self._send_player_message_from_interaction(interaction)
+            return
+
+        state.last_text_channel_id = interaction.channel_id
+        await self._refresh_or_create_player_message(interaction.guild.id)
+        await self._send_interaction_embed(
+            interaction,
+            info_embed("Máy phát nhạc đã được cập nhật."),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="volume", description="Chinh am luong theo server")
+    @app_commands.describe(level="Am luong tu 0 den 100")
+    async def volume(
+        self,
+        interaction: discord.Interaction,
+        level: app_commands.Range[int, 0, 100],
+    ) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        if await self._send_control_denied(interaction):
+            return
+
+        await self.player.set_volume(interaction.guild.id, int(level) / 100)
+        await self._send_interaction_embed(
+            interaction,
+            success_embed("Da cap nhat volume.", f"Volume: **{int(level)}%**"),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="loop", description="Chinh che do lap nhac")
+    @app_commands.describe(mode="off, track hoac queue")
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="off", value="off"),
+            app_commands.Choice(name="track", value="track"),
+            app_commands.Choice(name="queue", value="queue"),
+        ]
+    )
+    async def loop(
+        self,
+        interaction: discord.Interaction,
+        mode: app_commands.Choice[str],
+    ) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        if await self._send_control_denied(interaction):
+            return
+
+        await self.set_loop_from_interaction(
+            interaction,
+            cast(LoopMode, mode.value),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="remove", description="Xoa mot bai khoi queue")
+    @app_commands.describe(index="Vi tri bai trong queue, bat dau tu 1")
+    async def remove(self, interaction: discord.Interaction, index: int) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        if await self._send_control_denied(interaction):
+            return
+
+        removed = await self.player.remove(interaction.guild.id, index)
+        if removed is None:
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Vi tri queue khong hop le."),
                 ephemeral=True,
             )
             return
 
-        lines: list[str] = []
-        if current is not None:
-            lines.append(
-                f"Dang phat: **{current.track.title}** - yeu cau boi {current.requester.mention}"
-            )
+        await self._send_interaction_embed(
+            interaction,
+            success_embed("Da xoa khoi queue.", f"**{removed.track.title}**"),
+            ephemeral=True,
+        )
 
-        if upcoming:
-            lines.append("Sap phat:")
-            for index, queued_track in enumerate(upcoming[:10], start=1):
-                lines.append(
-                    f"{index}. **{queued_track.track.title}** - {queued_track.requester.mention}"
-                )
+    @app_commands.command(name="shuffle", description="Tron queue hien tai")
+    async def shuffle(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
 
-            if len(upcoming) > 10:
-                lines.append(f"... va {len(upcoming) - 10} bai nua.")
+        if await self._send_control_denied(interaction):
+            return
 
-        await interaction.response.send_message("\n".join(lines))
+        await self.shuffle_from_interaction(interaction)
+
+    @app_commands.command(name="clearqueue", description="Xoa queue nhung khong dung bai dang phat")
+    async def clearqueue(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        if await self._send_control_denied(interaction):
+            return
+
+        removed_count = await self.player.clear_queue(interaction.guild.id)
+        await self._send_interaction_embed(
+            interaction,
+            success_embed(
+                "Da xoa queue.",
+                f"Da xoa **{removed_count}** bai. Bai hien tai van tiep tuc phat.",
+            ),
+            ephemeral=True,
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

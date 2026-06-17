@@ -28,7 +28,8 @@ Discord bot viet bang Python, tap trung vao slash command, prefix command va pha
 - Phat nhac tu YouTube link hoac tu khoa tim kiem.
 - Queue rieng cho tung Discord server.
 - Tu dong phat bai tiep theo khi bai hien tai ket thuc.
-- Ho tro `/pause`, `/resume`, `/skip`, `/stop`, `/leave`.
+- Ho tro `/pause`, `/resume`, `/skip`, `/stop`, `/leave`, `/nowplaying`, `/volume`, `/loop`, `/remove`, `/shuffle`, `/clearqueue`.
+- Embed Now Playing co nut dieu khien nhanh: pause/resume, skip, stop, queue va loop.
 - Dung `yt-dlp` de lay audio stream va FFmpeg de phat vao voice channel.
 - Uu tien audio Opus va refresh stream truoc khi phat de giam loi bi im/giat.
 
@@ -54,6 +55,12 @@ Discord bot viet bang Python, tap trung vao slash command, prefix command va pha
 | `/clear <amount>` | Xoa tin nhan, nhap so hoac `all` |
 | `/play <query>` | Phat nhac tu link YouTube hoac tu khoa |
 | `/queue` | Xem bai dang phat va danh sach cho |
+| `/nowplaying` | Xem embed bai dang phat hien tai |
+| `/volume <0-100>` | Chinh am luong rieng cho server |
+| `/loop <off\|track\|queue>` | Chinh che do lap |
+| `/remove <index>` | Xoa mot bai khoi queue |
+| `/shuffle` | Tron queue hien tai |
+| `/clearqueue` | Xoa queue nhung giu bai dang phat |
 | `/pause` | Tam dung bai dang phat |
 | `/resume` | Phat tiep bai dang pause |
 | `/skip` | Bo qua bai hien tai |
@@ -81,8 +88,11 @@ discord-bot/
     |-- services/
     |   |-- logger.py
     |   `-- youtube.py
-    `-- utils/
-        `-- checks.py
+    |-- utils/
+    |   |-- checks.py
+    |   `-- time.py
+    `-- views/
+        `-- music_player.py
 ```
 
 ## Installation
@@ -185,18 +195,18 @@ Neu bot vao voice nhung khong nghe tieng hoac bi giat:
 - Cap nhat `yt-dlp` bang `pip install -U yt-dlp`.
 - Kiem tra quyen Connect va Speak cua bot.
 - Kiem tra mang cua may/VPS dang chay bot.
+- Thu `/nowplaying` de xem player embed va dung cac nut pause/resume, skip, stop, queue, loop.
+- Thu `/volume 30`, `/loop track`, `/shuffle`, `/remove 1`, `/clearqueue` khi queue co nhieu bai.
 
 ## Notes
 
 - Queue dang luu trong RAM, restart bot se mat queue.
-- Bot chua ho tro playlist, Spotify, volume control, database hoac web dashboard.
+- Bot chua ho tro playlist, Spotify, database hoac web dashboard.
 - Logic YouTube nam trong `bot/services/youtube.py`.
 - Logic voice va queue nam trong `bot/cogs/music.py`.
+- UI button cua music player nam trong `bot/views/music_player.py`.
 
 ## Roadmap
 
-- Them `/nowplaying`.
-- Them volume control.
-- Them Discord UI button cho music player.
 - Luu queue hoac lich su bai hat vao database.
 - Them role DJ de gioi han quyen skip/stop.
