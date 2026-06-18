@@ -616,6 +616,104 @@ class MusicCog(commands.Cog):
         )
         await self._refresh_or_create_player_message(interaction.guild.id)
 
+    @app_commands.command(name="playnext", description="Them bai vao dau queue de phat tiep theo")
+    @app_commands.describe(query="YouTube link hoac tu khoa can phat tiep theo")
+    async def playnext(self, interaction: discord.Interaction, query: str) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        await interaction.response.defer()
+
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.followup.send(
+                embed=error_embed("Khong xac dinh duoc thanh vien trong server."),
+                ephemeral=True,
+            )
+            return
+
+        if await self._send_control_denied(interaction):
+            return
+
+        if not self._ffmpeg_is_available():
+            await interaction.followup.send(
+                embed=error_embed(
+                    "Khong tim thay FFmpeg.",
+                    "Hay cai FFmpeg va them vao PATH truoc khi dung /playnext.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        track = await self.youtube.search(query)
+        if track is None:
+            await interaction.followup.send(
+                embed=error_embed(
+                    "Khong tim thay bai hat.",
+                    "Thu tu khoa khac hoac gui link YouTube truc tiep.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        voice_client = await self._ensure_voice(interaction, interaction.user)
+        if voice_client is None:
+            return
+
+        try:
+            queued_track, was_idle = await self.player.insert_next(
+                interaction.guild,
+                voice_client,
+                track,
+                interaction.user,
+                interaction.channel_id,
+            )
+        except QueueFullError as exc:
+            await interaction.followup.send(
+                embed=error_embed(
+                    "Queue da day.",
+                    f"Gioi han hien tai la {exc.max_size} bai.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if was_idle:
+            state = self.player.get_state(interaction.guild.id)
+            if state.current is None:
+                await interaction.followup.send(
+                    embed=error_embed(
+                        "Khong the bat dau phat bai nay.",
+                        "Hay kiem tra FFmpeg, mang, hoac thu mot bai khac.",
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if state.player_message_id is None:
+                await self._send_player_message_from_interaction(interaction)
+            else:
+                await self._refresh_or_create_player_message(interaction.guild.id)
+
+            await interaction.followup.send(
+                embed=success_embed(
+                    "May phat nhac da bat dau.",
+                    f"**[{queued_track.track.title}]({queued_track.track.webpage_url})**",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            embed=success_embed(
+                "Da them vao dau queue.",
+                f"**[{queued_track.track.title}]({queued_track.track.webpage_url})**\n"
+                "Bai nay se phat tiep theo.",
+            ),
+            ephemeral=True,
+        )
+        await self._refresh_or_create_player_message(interaction.guild.id)
+
     @app_commands.command(name="skip", description="Bo qua bai hien tai")
     async def skip(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -672,6 +770,35 @@ class MusicCog(commands.Cog):
         await self._send_interaction_embed(
             interaction,
             success_embed("Da resume máy phát nhạc."),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="previous", description="Phat lai bai truoc do")
+    async def previous(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        if await self._send_control_denied(interaction):
+            return
+
+        previous_track = await self.player.previous(interaction.guild.id)
+        if previous_track is None:
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Khong co bai truoc do de phat lai."),
+                ephemeral=True,
+            )
+            return
+
+        await self._send_interaction_embed(
+            interaction,
+            success_embed(
+                "Dang phat lai bai truoc do.",
+                f"**[{previous_track.track.title}]({previous_track.track.webpage_url})**",
+            ),
             ephemeral=True,
         )
 
@@ -804,6 +931,42 @@ class MusicCog(commands.Cog):
         await self._send_interaction_embed(
             interaction,
             success_embed("Da xoa khoi queue.", f"**{removed.track.title}**"),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="move", description="Chuyen vi tri bai trong queue")
+    @app_commands.describe(
+        from_index="Vi tri bai can chuyen, bat dau tu 1",
+        to_index="Vi tri moi, bat dau tu 1",
+    )
+    async def move(
+        self,
+        interaction: discord.Interaction,
+        from_index: int,
+        to_index: int,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        if await self._send_control_denied(interaction):
+            return
+
+        moved = await self.player.move(interaction.guild.id, from_index, to_index)
+        if not moved:
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Vi tri queue khong hop le."),
+                ephemeral=True,
+            )
+            return
+
+        await self._send_interaction_embed(
+            interaction,
+            success_embed(
+                "Da chuyen vi tri bai trong queue.",
+                f"Tu **{from_index}** sang **{to_index}**.",
+            ),
             ephemeral=True,
         )
 

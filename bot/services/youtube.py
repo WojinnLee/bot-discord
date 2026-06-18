@@ -1,5 +1,7 @@
 import asyncio
+from dataclasses import replace
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import yt_dlp
@@ -28,18 +30,70 @@ class YouTubeService:
             "socket_timeout": 15,
             "source_address": "0.0.0.0",
         }
+        self._search_cache: dict[str, tuple[YouTubeTrack, datetime]] = {}
+        self._search_cache_ttl = timedelta(minutes=10)
+        self._search_cache_max_size = 100
 
     async def search(self, query: str) -> YouTubeTrack | None:
         query = query.strip()
         if not query:
             return None
 
+        cached_track = self._get_cached_search(query)
+        if cached_track is not None:
+            return cached_track
+
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._extract_track, query)
+        track = await loop.run_in_executor(None, self._extract_track, query)
+        if track is not None:
+            self._set_cached_search(query, track)
+
+        return track
 
     async def refresh(self, track: YouTubeTrack) -> YouTubeTrack | None:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._extract_track, track.webpage_url)
+
+    def clear_expired_cache(self) -> None:
+        now = self._now()
+        expired_keys = [
+            key
+            for key, (_, cached_at) in self._search_cache.items()
+            if now - cached_at >= self._search_cache_ttl
+        ]
+        for key in expired_keys:
+            del self._search_cache[key]
+
+    def _get_cached_search(self, query: str) -> YouTubeTrack | None:
+        self.clear_expired_cache()
+        cache_key = self._cache_key(query)
+        cached = self._search_cache.get(cache_key)
+        if cached is None:
+            return None
+
+        track, cached_at = cached
+        if self._now() - cached_at >= self._search_cache_ttl:
+            del self._search_cache[cache_key]
+            return None
+
+        return replace(track)
+
+    def _set_cached_search(self, query: str, track: YouTubeTrack) -> None:
+        self.clear_expired_cache()
+        if len(self._search_cache) >= self._search_cache_max_size:
+            oldest_key = min(
+                self._search_cache,
+                key=lambda key: self._search_cache[key][1],
+            )
+            del self._search_cache[oldest_key]
+
+        self._search_cache[self._cache_key(query)] = (replace(track), self._now())
+
+    def _cache_key(self, query: str) -> str:
+        return query.strip().lower()
+
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc)
 
     def _extract_track(self, query: str) -> YouTubeTrack | None:
         try:
