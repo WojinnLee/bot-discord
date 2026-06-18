@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 import shutil
@@ -13,15 +14,19 @@ from bot.services.music_player import (
     MusicPlayerService,
     QueueFullError,
 )
-from bot.services.youtube import YouTubeService
+from bot.services.progress import format_progress_bar
+from bot.services.search_card import build_music_search_card
+from bot.services.youtube import YouTubeService, YouTubeTrack
 from bot.utils.embeds import error_embed, info_embed, success_embed
 from bot.utils.time import format_duration
 
 
 QUEUE_PAGE_SIZE = 10
 PROGRESS_BAR_WIDTH = 18
-SEARCH_RESULT_LIMIT = 5
+SEARCH_RESULT_LIMIT = 10
 PLAYLIST_ADD_LIMIT = 25
+PLAYER_RELATED_LIMIT = 8
+PLAYER_EMBED_COLOR = 0xFF6B5E
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,7 @@ class MusicCog(commands.Cog):
             self.youtube,
             self._refresh_or_create_player_message,
         )
+        self._related_track_cache: dict[int, tuple[str, list[YouTubeTrack]]] = {}
 
     async def _send_guild_only_error(self, interaction: discord.Interaction) -> None:
         await self._send_interaction_embed(
@@ -46,7 +52,11 @@ class MusicCog(commands.Cog):
     def _ffmpeg_is_available(self) -> bool:
         return shutil.which("ffmpeg") is not None
 
-    def _create_player_view(self, guild_id: int) -> discord.ui.View:
+    def _create_player_view(
+        self,
+        guild_id: int,
+        related_tracks: list[YouTubeTrack] | None = None,
+    ) -> discord.ui.View:
         from bot.views.music_player import MusicPlayerView
 
         state = self.player.get_state(guild_id)
@@ -61,6 +71,8 @@ class MusicCog(commands.Cog):
             is_paused=is_paused,
             has_current=state.current is not None,
             queue_size=len(state.queue),
+            has_previous=bool(state.history),
+            related_tracks=related_tracks or [],
         )
 
     def _create_queue_view(self, guild_id: int, page: int = 0) -> discord.ui.View:
@@ -73,10 +85,18 @@ class MusicCog(commands.Cog):
         guild_id: int,
         requester_id: int,
         tracks: list,
+        *,
+        allowed_voice_channel_id: int | None = None,
     ) -> discord.ui.View:
         from bot.views.music_search import MusicSearchView
 
-        return MusicSearchView(self, guild_id, requester_id, tracks)
+        return MusicSearchView(
+            self,
+            guild_id,
+            requester_id,
+            tracks,
+            allowed_voice_channel_id=allowed_voice_channel_id,
+        )
 
     def _build_player_embed(self, guild: discord.Guild) -> discord.Embed:
         state = self.player.get_state(guild.id)
@@ -237,6 +257,106 @@ class MusicCog(commands.Cog):
             f"**[{track.title}]({track.webpage_url})**",
         )
 
+    async def send_music_search_from_interaction(
+        self,
+        interaction: discord.Interaction,
+        query: str,
+        *,
+        ephemeral: bool = True,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        if not isinstance(interaction.user, discord.Member):
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Khong xac dinh duoc thanh vien trong server."),
+                ephemeral=True,
+            )
+            return
+
+        query = query.strip()
+        if not query:
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Hay nhap tu khoa can tim."),
+                ephemeral=True,
+            )
+            return
+
+        tracks = await self.youtube.search_many(query, limit=SEARCH_RESULT_LIMIT)
+        if not tracks:
+            await self._send_interaction_embed(
+                interaction,
+                error_embed(
+                    "Khong tim thay ket qua.",
+                    "Thu tu khoa khac hoac dung link YouTube truc tiep.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        allowed_voice_channel_id = (
+            interaction.user.voice.channel.id
+            if interaction.user.voice is not None and interaction.user.voice.channel is not None
+            else None
+        )
+        view = self._create_search_view(
+            interaction.guild.id,
+            interaction.user.id,
+            tracks,
+            allowed_voice_channel_id=allowed_voice_channel_id,
+        )
+
+        try:
+            image_buffer = await asyncio.to_thread(build_music_search_card, query, tracks)
+            file = discord.File(image_buffer, filename="search.png")
+            message = await self._send_search_response(
+                interaction,
+                view=view,
+                ephemeral=ephemeral,
+                file=file,
+            )
+        except Exception:
+            logger.exception("Failed to build music search card")
+            embed = self.build_search_embed(query, tracks)
+            message = await self._send_search_response(
+                interaction,
+                view=view,
+                ephemeral=ephemeral,
+                embed=embed,
+            )
+
+        if hasattr(view, "message"):
+            view.message = message
+
+    async def _send_search_response(
+        self,
+        interaction: discord.Interaction,
+        *,
+        view: discord.ui.View,
+        ephemeral: bool,
+        file: discord.File | None = None,
+        embed: discord.Embed | None = None,
+    ) -> discord.Message:
+        if interaction.response.is_done():
+            return await interaction.followup.send(
+                embed=embed,
+                file=file,
+                view=view,
+                ephemeral=ephemeral,
+                wait=True,
+            )
+
+        await interaction.response.send_message(
+            embed=embed,
+            file=file,
+            view=view,
+            ephemeral=ephemeral,
+        )
+        return await interaction.original_response()
+
     def get_queue_total_pages(self, guild_id: int) -> int:
         state = self.player.get_state(guild_id)
         return max(1, math.ceil(len(state.queue) / QUEUE_PAGE_SIZE))
@@ -294,8 +414,9 @@ class MusicCog(commands.Cog):
         if guild is None:
             return
 
+        related_tracks = await self._get_player_related_tracks(guild_id)
         embed = self._build_player_embed(guild)
-        view = self._create_player_view(guild_id)
+        view = self._create_player_view(guild_id, related_tracks)
 
         if state.player_message_id is not None and state.player_channel_id is not None:
             channel = self.bot.get_channel(state.player_channel_id)
@@ -337,8 +458,9 @@ class MusicCog(commands.Cog):
 
         state = self.player.get_state(interaction.guild.id)
         state.last_text_channel_id = interaction.channel_id
+        related_tracks = await self._get_player_related_tracks(interaction.guild.id)
         embed = self._build_player_embed(interaction.guild)
-        view = self._create_player_view(interaction.guild.id)
+        view = self._create_player_view(interaction.guild.id, related_tracks)
 
         if interaction.response.is_done():
             message = await interaction.followup.send(embed=embed, view=view)
@@ -925,46 +1047,11 @@ class MusicCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        if not isinstance(interaction.user, discord.Member):
-            await interaction.followup.send(
-                embed=error_embed("Khong xac dinh duoc thanh vien trong server."),
-                ephemeral=True,
-            )
-            return
-
-        query = query.strip()
-        if not query:
-            await interaction.followup.send(
-                embed=error_embed("Hay nhap tu khoa can tim."),
-                ephemeral=True,
-            )
-            return
-
-        tracks = await self.youtube.search_many(query, limit=SEARCH_RESULT_LIMIT)
-        if not tracks:
-            await interaction.followup.send(
-                embed=error_embed(
-                    "Khong tim thay ket qua.",
-                    "Thu tu khoa khac hoac dung link YouTube truc tiep.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        embed = self.build_search_embed(query, tracks)
-        view = self._create_search_view(
-            interaction.guild.id,
-            interaction.user.id,
-            tracks,
-        )
-        message = await interaction.followup.send(
-            embed=embed,
-            view=view,
+        await self.send_music_search_from_interaction(
+            interaction,
+            query,
             ephemeral=True,
-            wait=True,
         )
-        if hasattr(view, "message"):
-            view.message = message
 
     @app_commands.command(name="skip", description="Bo qua bai hien tai")
     async def skip(self, interaction: discord.Interaction) -> None:
@@ -1249,6 +1336,194 @@ class MusicCog(commands.Cog):
                 "Da xoa queue.",
                 f"Da xoa **{removed_count}** bai. Bai hien tai van tiep tuc phat.",
             ),
+            ephemeral=True,
+        )
+
+    def _build_player_embed(self, guild: discord.Guild) -> discord.Embed:
+        state = self.player.get_state(guild.id)
+        current = state.current
+
+        if current is None:
+            title = "🖍️ Máy phát nhạc đã dừng" if state.stopped else "🖍️ Máy phát nhạc đang trống"
+            description = "Không có bài nào đang phát."
+            if state.queue:
+                description = "Đang chuẩn bị phát bài tiếp theo."
+
+            embed = discord.Embed(
+                title=title,
+                description=description,
+                color=PLAYER_EMBED_COLOR,
+            )
+            embed.add_field(name="Queue", value=f"{len(state.queue)} bài", inline=True)
+            embed.add_field(name="Loop", value=self._format_loop_mode(state.loop_mode), inline=True)
+            embed.add_field(name="Volume", value=f"{int(state.volume * 100)}%", inline=True)
+            embed.add_field(
+                name="Kết nối",
+                value=self._format_voice_status(state.voice_status),
+                inline=True,
+            )
+            if state.last_error:
+                embed.add_field(name="Thông báo", value=state.last_error[:900], inline=False)
+            embed.set_footer(text=f"{guild.name} Máy phát nhạc của Shin")
+            return embed
+
+        voice_client = self.player.get_voice_client(guild)
+        if state.voice_status == "reconnecting":
+            status = "Đang kết nối lại"
+            color = 0xFF9F68
+        elif state.voice_status == "disconnected":
+            status = "Mất kết nối"
+            color = 0xFF6B5E
+        elif voice_client is not None and voice_client.is_paused():
+            status = "Paused"
+            color = 0xFFD36E
+        else:
+            status = "Playing"
+            color = PLAYER_EMBED_COLOR
+
+        track = current.track
+        artist = track.uploader or track.source or "YouTube"
+        embed = discord.Embed(
+            title=f"🎵 {status} • {track.title}",
+            description=f"**[{track.title}]({track.webpage_url})**\n{artist}",
+            color=color,
+        )
+        embed.add_field(
+            name="🖍️ Progress",
+            value=self._format_progress(guild.id, track.duration),
+            inline=False,
+        )
+        embed.add_field(name="🙋 Requested by", value=current.requester.mention, inline=True)
+        embed.add_field(name="🔊 Volume", value=f"{int(state.volume * 100)}%", inline=True)
+        embed.add_field(name="🔁 Loop", value=self._format_loop_mode(state.loop_mode), inline=True)
+        embed.add_field(name="📜 Queue", value=f"{len(state.queue)} bài", inline=True)
+        embed.add_field(name="🎨 Source", value=track.source or "YouTube", inline=True)
+        embed.add_field(
+            name="📡 Trạng thái",
+            value=self._format_voice_status(state.voice_status),
+            inline=True,
+        )
+        embed.add_field(
+            name="⏱️ Duration",
+            value=format_duration(track.duration),
+            inline=True,
+        )
+        if state.last_error:
+            embed.add_field(name="Thông báo", value=state.last_error[:900], inline=False)
+        if track.thumbnail_url:
+            embed.set_image(url=track.thumbnail_url)
+        embed.set_footer(
+            text=f"{guild.name} • Cartoon pastel player • {current.requester.display_name}"
+        )
+        return embed
+
+    def _format_voice_status(self, voice_status: str) -> str:
+        if voice_status == "reconnecting":
+            return "Đang kết nối lại..."
+        if voice_status == "disconnected":
+            return "Đã mất kết nối"
+        return "Đang kết nối"
+
+    def _format_loop_mode(self, loop_mode: LoopMode) -> str:
+        labels = {
+            "off": "Off",
+            "track": "Track",
+            "queue": "Queue",
+        }
+        return labels.get(loop_mode, str(loop_mode))
+
+    def _format_progress(self, guild_id: int, duration: int | None) -> str:
+        elapsed = self.player.get_elapsed_seconds(guild_id)
+        return format_progress_bar(elapsed, duration, width=PROGRESS_BAR_WIDTH)
+
+    async def _get_player_related_tracks(self, guild_id: int) -> list[YouTubeTrack]:
+        state = self.player.get_state(guild_id)
+        current = state.current
+        if current is None:
+            self._related_track_cache.pop(guild_id, None)
+            return []
+
+        track = current.track
+        cache_key = track.webpage_url or track.title
+        cached = self._related_track_cache.get(guild_id)
+        if cached is not None and cached[0] == cache_key:
+            return list(cached[1])
+
+        query = f"{track.title} {track.uploader or ''}".strip()
+        tracks = await self.youtube.search_many(query, limit=PLAYER_RELATED_LIMIT + 2)
+        related = [
+            candidate
+            for candidate in tracks
+            if candidate.webpage_url != track.webpage_url
+        ][:PLAYER_RELATED_LIMIT]
+        self._related_track_cache[guild_id] = (cache_key, related)
+        return list(related)
+
+    async def add_player_related_from_interaction(
+        self,
+        interaction: discord.Interaction,
+        track: YouTubeTrack,
+    ) -> None:
+        await self.add_search_result_from_interaction(interaction, track)
+
+    async def previous_from_interaction(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        previous_track = await self.player.previous(interaction.guild.id)
+        if previous_track is None:
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Không có bài trước đó để phát lại."),
+                ephemeral=True,
+            )
+            return
+
+        await self._send_interaction_embed(
+            interaction,
+            success_embed(
+                "Đang phát lại bài trước đó.",
+                f"**[{previous_track.track.title}]({previous_track.track.webpage_url})**",
+            ),
+            ephemeral=True,
+        )
+
+    async def handle_player_function_from_interaction(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        if action == "search":
+            from bot.views.music_search import MusicSearchModal
+
+            await interaction.response.send_modal(MusicSearchModal(self))
+            return
+
+        if action == "loop":
+            next_loop = await self.player.cycle_loop(interaction.guild.id)
+            await self._send_interaction_embed(
+                interaction,
+                success_embed("Đã cập nhật loop.", f"Loop mode: **{next_loop}**"),
+                ephemeral=True,
+            )
+            return
+
+        if action == "queue":
+            await self.send_queue_from_interaction(interaction, ephemeral=True)
+            return
+
+        if action == "shuffle":
+            await self.shuffle_from_interaction(interaction)
+            return
+
+        await self._send_interaction_embed(
+            interaction,
+            error_embed("Chức năng này chưa được hỗ trợ."),
             ephemeral=True,
         )
 

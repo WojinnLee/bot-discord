@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import discord
+
+from bot.services.youtube import YouTubeTrack
+from bot.utils.time import format_duration
 
 if TYPE_CHECKING:
     from bot.cogs.music import MusicCog
     from bot.services.music_player import LoopMode
+
+
+RELATED_EMPTY_VALUE = "empty"
 
 
 class MusicPlayerView(discord.ui.View):
@@ -19,207 +25,259 @@ class MusicPlayerView(discord.ui.View):
         is_paused: bool,
         has_current: bool,
         queue_size: int,
+        has_previous: bool,
+        related_tracks: list[YouTubeTrack],
     ):
         super().__init__(timeout=None)
         self.music_cog = music_cog
         self.guild_id = guild_id
-        self._style_controls(
-            loop_mode=loop_mode,
-            is_paused=is_paused,
-            has_current=has_current,
-            queue_size=queue_size,
+        self.related_tracks = related_tracks[:8]
+
+        self.add_item(PlayerRelatedSelect(self.related_tracks, disabled=not has_current))
+        self.add_item(
+            PlayerFunctionSelect(
+                loop_mode=loop_mode,
+                queue_size=queue_size,
+                disabled=not has_current and queue_size == 0,
+            )
         )
+        self.add_item(PlayerRefreshButton())
+        self.add_item(PlayerPreviousButton(disabled=not has_previous))
+        self.add_item(PlayerPauseButton(is_paused=is_paused, disabled=not has_current))
+        self.add_item(PlayerNextButton(disabled=not has_current))
+        self.add_item(PlayerStopButton(disabled=not has_current))
 
-    def _style_controls(
-        self,
-        *,
-        loop_mode: LoopMode,
-        is_paused: bool,
-        has_current: bool,
-        queue_size: int,
-    ) -> None:
-        for item in self.children:
-            if not isinstance(item, discord.ui.Button):
-                if isinstance(item, discord.ui.Select) and item.custom_id == "music_loop":
-                    item.placeholder = f"Loop: {loop_mode}"
-                    for option in item.options:
-                        option.default = option.value == loop_mode
-                continue
-
-            if item.custom_id == "music_pause":
-                item.label = "Resume" if is_paused else "Pause"
-                item.emoji = "▶" if is_paused else "⏸"
-                item.style = discord.ButtonStyle.success if is_paused else discord.ButtonStyle.primary
-                item.disabled = not has_current
-            elif item.custom_id in {"music_skip", "music_stop"}:
-                item.disabled = not has_current
-            elif item.custom_id == "music_shuffle":
-                item.disabled = queue_size < 2
-
-    async def _can_control(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.guild is None or interaction.guild.id != self.guild_id:
             await interaction.response.send_message(
-                "Music controls chi dung duoc trong server nay.",
+                "Music controls chỉ dùng được trong server này.",
                 ephemeral=True,
             )
             return False
 
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
-                "Khong xac dinh duoc thanh vien trong server.",
+                "Không xác định được thành viên trong server.",
                 ephemeral=True,
             )
             return False
 
-        allowed = await self.music_cog.can_use_player_control(
-            interaction,
-            interaction.user,
-        )
+        allowed = await self.music_cog.can_use_player_control(interaction, interaction.user)
         if not allowed:
             await interaction.response.send_message(
-                "Ban can o cung voice channel voi bot hoac co quyen quan ly server.",
+                "Bạn cần ở cùng voice channel với bot hoặc có quyền quản lý server.",
                 ephemeral=True,
             )
             return False
 
         return True
 
-    @discord.ui.button(
-        label="Pause",
-        emoji="⏸",
-        style=discord.ButtonStyle.primary,
-        custom_id="music_pause",
-        row=0,
-    )
-    async def pause_resume(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button[MusicPlayerView],
-    ) -> None:
-        if not await self._can_control(interaction):
-            return
 
-        await self.music_cog.toggle_pause_from_interaction(interaction)
+class PlayerRelatedSelect(discord.ui.Select[MusicPlayerView]):
+    def __init__(self, tracks: list[YouTubeTrack], *, disabled: bool):
+        options: list[discord.SelectOption] = []
+        for index, track in enumerate(tracks):
+            options.append(
+                discord.SelectOption(
+                    label=_truncate(f"{index + 1}. {track.title or 'Unknown title'}", 100),
+                    value=str(index),
+                    description=_truncate(
+                        f"{format_duration(track.duration)} - {track.uploader or track.source or 'YouTube'}",
+                        100,
+                    ),
+                    emoji="🎵",
+                )
+            )
 
-    @discord.ui.button(
-        label="Skip",
-        emoji="⏭",
-        style=discord.ButtonStyle.secondary,
-        custom_id="music_skip",
-        row=0,
-    )
-    async def skip(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button[MusicPlayerView],
-    ) -> None:
-        if not await self._can_control(interaction):
-            return
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Chưa có bài gợi ý",
+                    value=RELATED_EMPTY_VALUE,
+                    description="Bấm Search Tracks để tìm bài mới.",
+                    emoji="🖍️",
+                )
+            )
+            disabled = True
 
-        await self.music_cog.skip_from_interaction(interaction)
-
-    @discord.ui.button(
-        label="Stop",
-        emoji="⏹",
-        style=discord.ButtonStyle.danger,
-        custom_id="music_stop",
-        row=0,
-    )
-    async def stop(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button[MusicPlayerView],
-    ) -> None:
-        if not await self._can_control(interaction):
-            return
-
-        await self.music_cog.stop_from_interaction(interaction)
-
-    @discord.ui.button(
-        label="Queue",
-        emoji="📜",
-        style=discord.ButtonStyle.secondary,
-        custom_id="music_queue",
-        row=0,
-    )
-    async def queue(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button[MusicPlayerView],
-    ) -> None:
-        if not await self._can_control(interaction):
-            return
-
-        await self.music_cog.send_queue_from_interaction(
-            interaction,
-            ephemeral=True,
+        super().__init__(
+            custom_id="music_player_related",
+            placeholder="▶ | Chọn một bài hát để thêm vào hàng đợi",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+            disabled=disabled,
         )
 
-    @discord.ui.button(
-        label="Refresh",
-        emoji="🔄",
-        style=discord.ButtonStyle.secondary,
-        custom_id="music_refresh",
-        row=1,
-    )
-    async def refresh(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button[MusicPlayerView],
-    ) -> None:
-        if not await self._can_control(interaction):
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if view is None:
+            await interaction.response.send_message(
+                "Player UI không còn hợp lệ.",
+                ephemeral=True,
+            )
             return
 
-        await self.music_cog.refresh_player_from_interaction(interaction)
-
-    @discord.ui.button(
-        label="Shuffle",
-        emoji="🔀",
-        style=discord.ButtonStyle.secondary,
-        custom_id="music_shuffle",
-        row=1,
-    )
-    async def shuffle(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button[MusicPlayerView],
-    ) -> None:
-        if not await self._can_control(interaction):
+        value = self.values[0]
+        if value == RELATED_EMPTY_VALUE:
+            await interaction.response.send_message(
+                "Chưa có bài gợi ý để thêm.",
+                ephemeral=True,
+            )
             return
 
-        await self.music_cog.shuffle_from_interaction(interaction)
+        try:
+            track = view.related_tracks[int(value)]
+        except (ValueError, IndexError):
+            await interaction.response.send_message(
+                "Lựa chọn bài hát không hợp lệ.",
+                ephemeral=True,
+            )
+            return
 
-    @discord.ui.select(
-        placeholder="Loop mode",
-        custom_id="music_loop",
-        min_values=1,
-        max_values=1,
-        row=2,
-        options=[
+        await interaction.response.defer(ephemeral=True)
+        await view.music_cog.add_player_related_from_interaction(interaction, track)
+
+
+class PlayerFunctionSelect(discord.ui.Select[MusicPlayerView]):
+    def __init__(self, *, loop_mode: LoopMode, queue_size: int, disabled: bool):
+        options = [
             discord.SelectOption(
-                label="Off",
-                value="off",
-                description="Play through once.",
+                label="Search Tracks",
+                value="search",
+                description="Tìm bài hát bằng search.",
+                emoji="🔎",
             ),
             discord.SelectOption(
-                label="Repeat Track",
-                value="track",
-                description="Replay the current track.",
+                label=f"Loop: {loop_mode}",
+                value="loop",
+                description="Đổi chế độ lặp Off/Track/Queue.",
+                emoji="🔁",
             ),
             discord.SelectOption(
-                label="Repeat Queue",
+                label="Queue",
                 value="queue",
-                description="Keep the full queue moving.",
+                description="Mở hàng đợi hiện tại.",
+                emoji="📜",
             ),
-        ],
-    )
-    async def loop(
-        self,
-        interaction: discord.Interaction,
-        select: discord.ui.Select[MusicPlayerView],
-    ) -> None:
-        if not await self._can_control(interaction):
+        ]
+        if queue_size >= 2:
+            options.append(
+                discord.SelectOption(
+                    label="Shuffle",
+                    value="shuffle",
+                    description="Trộn hàng đợi.",
+                    emoji="🔀",
+                )
+            )
+
+        super().__init__(
+            custom_id="music_player_functions",
+            placeholder="▶ | Chọn một chức năng khác để điều khiển máy phất nhạc",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1,
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if view is None:
+            await interaction.response.send_message(
+                "Player UI không còn hợp lệ.",
+                ephemeral=True,
+            )
             return
 
-        loop_mode = cast("LoopMode", select.values[0])
-        await self.music_cog.set_loop_from_interaction(interaction, loop_mode)
+        await view.music_cog.handle_player_function_from_interaction(
+            interaction,
+            self.values[0],
+        )
+
+
+class PlayerRefreshButton(discord.ui.Button[MusicPlayerView]):
+    def __init__(self):
+        super().__init__(
+            emoji="🔄",
+            style=discord.ButtonStyle.secondary,
+            custom_id="music_refresh",
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if view is not None:
+            await view.music_cog.refresh_player_from_interaction(interaction)
+
+
+class PlayerPreviousButton(discord.ui.Button[MusicPlayerView]):
+    def __init__(self, *, disabled: bool):
+        super().__init__(
+            emoji="⏮️",
+            style=discord.ButtonStyle.secondary,
+            custom_id="music_previous",
+            row=2,
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if view is not None:
+            await view.music_cog.previous_from_interaction(interaction)
+
+
+class PlayerPauseButton(discord.ui.Button[MusicPlayerView]):
+    def __init__(self, *, is_paused: bool, disabled: bool):
+        super().__init__(
+            emoji="▶️" if is_paused else "⏸️",
+            style=discord.ButtonStyle.success if is_paused else discord.ButtonStyle.primary,
+            custom_id="music_pause",
+            row=2,
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if view is not None:
+            await view.music_cog.toggle_pause_from_interaction(interaction)
+
+
+class PlayerNextButton(discord.ui.Button[MusicPlayerView]):
+    def __init__(self, *, disabled: bool):
+        super().__init__(
+            emoji="⏭️",
+            style=discord.ButtonStyle.secondary,
+            custom_id="music_skip",
+            row=2,
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if view is not None:
+            await view.music_cog.skip_from_interaction(interaction)
+
+
+class PlayerStopButton(discord.ui.Button[MusicPlayerView]):
+    def __init__(self, *, disabled: bool):
+        super().__init__(
+            emoji="⏹️",
+            style=discord.ButtonStyle.danger,
+            custom_id="music_stop",
+            row=2,
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if view is not None:
+            await view.music_cog.stop_from_interaction(interaction)
+
+
+def _truncate(value: str, max_length: int) -> str:
+    value = " ".join(str(value).split())
+    if len(value) <= max_length:
+        return value
+    return f"{value[: max_length - 3].rstrip()}..."
