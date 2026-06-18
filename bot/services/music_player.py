@@ -109,6 +109,10 @@ class MusicPlayerService:
     def get_voice_client(self, guild: discord.Guild) -> discord.VoiceClient | None:
         return cast(discord.VoiceClient | None, guild.voice_client)
 
+    def available_queue_slots(self, guild_id: int) -> int:
+        state = self.get_state(guild_id)
+        return max(0, MAX_QUEUE_SIZE - len(state.queue))
+
     async def add_track(
         self,
         guild: discord.Guild,
@@ -191,6 +195,109 @@ class MusicPlayerService:
             await self.on_state_change(guild.id)
 
         return queued_track, was_idle
+
+    async def add_tracks(
+        self,
+        guild: discord.Guild,
+        voice_client: discord.VoiceClient,
+        tracks: list[YouTubeTrack],
+        requester: discord.Member,
+        text_channel_id: int | None,
+    ) -> tuple[int, bool]:
+        state = self.get_state(guild.id)
+        if not tracks:
+            return 0, False
+
+        queued_tracks = [
+            QueuedTrack(track=track, requester=requester)
+            for track in tracks
+        ]
+
+        async with state.lock:
+            slots = MAX_QUEUE_SIZE - len(state.queue)
+            if slots <= 0:
+                raise QueueFullError(MAX_QUEUE_SIZE)
+
+            queued_tracks = queued_tracks[:slots]
+            was_idle = (
+                state.current is None
+                and not voice_client.is_playing()
+                and not voice_client.is_paused()
+            )
+            state.queue.extend(queued_tracks)
+            state.suppress_next_after = False
+            state.skip_requested = False
+            state.stopped = False
+            state.voice_status = "connected"
+            state.reconnect_started_at = None
+            state.last_error = None
+            state.last_text_channel_id = text_channel_id
+            state.last_activity_at = self._now()
+            self._invalidate_preload_locked(state)
+            self._ensure_voice_monitor_locked(guild.id, state)
+            added_count = len(queued_tracks)
+
+        if was_idle:
+            await self.play_next(guild.id)
+        else:
+            await self._preload_next_track(guild.id)
+            await self.on_state_change(guild.id)
+
+        return added_count, was_idle
+
+    async def insert_tracks_next(
+        self,
+        guild: discord.Guild,
+        voice_client: discord.VoiceClient,
+        tracks: list[YouTubeTrack],
+        requester: discord.Member,
+        text_channel_id: int | None,
+    ) -> tuple[int, bool]:
+        state = self.get_state(guild.id)
+        if not tracks:
+            return 0, False
+
+        queued_tracks = [
+            QueuedTrack(track=track, requester=requester)
+            for track in tracks
+        ]
+
+        async with state.lock:
+            slots = MAX_QUEUE_SIZE - len(state.queue)
+            if slots <= 0:
+                raise QueueFullError(MAX_QUEUE_SIZE)
+
+            queued_tracks = queued_tracks[:slots]
+            was_idle = (
+                state.current is None
+                and not voice_client.is_playing()
+                and not voice_client.is_paused()
+            )
+            if was_idle:
+                state.queue.extend(queued_tracks)
+            else:
+                for queued_track in reversed(queued_tracks):
+                    state.queue.appendleft(queued_track)
+
+            state.suppress_next_after = False
+            state.skip_requested = False
+            state.stopped = False
+            state.voice_status = "connected"
+            state.reconnect_started_at = None
+            state.last_error = None
+            state.last_text_channel_id = text_channel_id
+            state.last_activity_at = self._now()
+            self._invalidate_preload_locked(state)
+            self._ensure_voice_monitor_locked(guild.id, state)
+            added_count = len(queued_tracks)
+
+        if was_idle:
+            await self.play_next(guild.id)
+        else:
+            await self._preload_next_track(guild.id)
+            await self.on_state_change(guild.id)
+
+        return added_count, was_idle
 
     async def play_next(self, guild_id: int) -> bool:
         state = self.get_state(guild_id)

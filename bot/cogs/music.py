@@ -20,6 +20,8 @@ from bot.utils.time import format_duration
 
 QUEUE_PAGE_SIZE = 10
 PROGRESS_BAR_WIDTH = 18
+SEARCH_RESULT_LIMIT = 5
+PLAYLIST_ADD_LIMIT = 25
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,16 @@ class MusicCog(commands.Cog):
         from bot.views.music_queue import MusicQueueView
 
         return MusicQueueView(self, guild_id, page)
+
+    def _create_search_view(
+        self,
+        guild_id: int,
+        requester_id: int,
+        tracks: list,
+    ) -> discord.ui.View:
+        from bot.views.music_search import MusicSearchView
+
+        return MusicSearchView(self, guild_id, requester_id, tracks)
 
     def _build_player_embed(self, guild: discord.Guild) -> discord.Embed:
         state = self.player.get_state(guild.id)
@@ -203,6 +215,27 @@ class MusicCog(commands.Cog):
             text=f"Page {page + 1}/{total_pages} • {len(upcoming)} bai trong queue"
         )
         return embed
+
+    def build_search_embed(self, query: str, tracks: list) -> discord.Embed:
+        embed = discord.Embed(
+            title="Ket qua tim kiem",
+            description=f"Chon mot bai cho: **{query}**",
+            color=discord.Color.blurple(),
+        )
+        for index, track in enumerate(tracks, start=1):
+            uploader = track.uploader or track.source or "YouTube"
+            embed.add_field(
+                name=f"{index}. {track.title[:80]}",
+                value=f"{uploader} • {format_duration(track.duration)}",
+                inline=False,
+            )
+        return embed
+
+    def build_search_selected_embed(self, track) -> discord.Embed:
+        return success_embed(
+            "Da chon bai hat.",
+            f"**[{track.title}]({track.webpage_url})**",
+        )
 
     def get_queue_total_pages(self, guild_id: int) -> int:
         state = self.player.get_state(guild_id)
@@ -511,6 +544,169 @@ class MusicCog(commands.Cog):
             ephemeral=ephemeral,
         )
 
+    async def add_search_result_from_interaction(
+        self,
+        interaction: discord.Interaction,
+        track,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        if not isinstance(interaction.user, discord.Member):
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Khong xac dinh duoc thanh vien trong server."),
+                ephemeral=True,
+            )
+            return
+
+        if not self._ffmpeg_is_available():
+            await self._send_interaction_embed(
+                interaction,
+                error_embed(
+                    "Khong tim thay FFmpeg.",
+                    "Hay cai FFmpeg va them vao PATH truoc khi chon bai.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        voice_client = await self._ensure_voice(interaction, interaction.user)
+        if voice_client is None:
+            return
+
+        try:
+            queued_track, was_idle = await self.player.add_track(
+                interaction.guild,
+                voice_client,
+                track,
+                interaction.user,
+                interaction.channel_id,
+            )
+        except QueueFullError:
+            await self._send_interaction_embed(
+                interaction,
+                error_embed("Queue da day.", f"Gioi han hien tai la {MAX_QUEUE_SIZE} bai."),
+                ephemeral=True,
+            )
+            return
+
+        if was_idle:
+            state = self.player.get_state(interaction.guild.id)
+            if state.player_message_id is None:
+                await self._send_player_message_from_interaction(interaction)
+            else:
+                await self._refresh_or_create_player_message(interaction.guild.id)
+        else:
+            await self._refresh_or_create_player_message(interaction.guild.id)
+
+        await self._send_interaction_embed(
+            interaction,
+            success_embed(
+                "Da them bai da chon.",
+                f"**[{queued_track.track.title}]({queued_track.track.webpage_url})**",
+            ),
+            ephemeral=True,
+        )
+
+    async def _handle_playlist_play(
+        self,
+        interaction: discord.Interaction,
+        query: str,
+        *,
+        play_next: bool,
+    ) -> bool:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return False
+
+        if not self.youtube.is_playlist_url(query):
+            return False
+
+        available_slots = self.player.available_queue_slots(interaction.guild.id)
+        if available_slots <= 0:
+            await interaction.followup.send(
+                embed=error_embed(
+                    "Queue da day.",
+                    f"Gioi han hien tai la {MAX_QUEUE_SIZE} bai.",
+                ),
+                ephemeral=True,
+            )
+            return True
+
+        limit = min(PLAYLIST_ADD_LIMIT, available_slots)
+        tracks = await self.youtube.extract_playlist(
+            query,
+            limit=PLAYLIST_ADD_LIMIT,
+            available_slots=available_slots,
+        )
+        if not tracks:
+            await interaction.followup.send(
+                embed=error_embed(
+                    "Playlist khong co bai hop le.",
+                    "Playlist co the rong, private, hoac co bai khong the phat.",
+                ),
+                ephemeral=True,
+            )
+            return True
+
+        voice_client = await self._ensure_voice(interaction, interaction.user)
+        if voice_client is None:
+            return True
+
+        try:
+            if play_next:
+                added_count, was_idle = await self.player.insert_tracks_next(
+                    interaction.guild,
+                    voice_client,
+                    tracks,
+                    interaction.user,
+                    interaction.channel_id,
+                )
+            else:
+                added_count, was_idle = await self.player.add_tracks(
+                    interaction.guild,
+                    voice_client,
+                    tracks,
+                    interaction.user,
+                    interaction.channel_id,
+                )
+        except QueueFullError:
+            await interaction.followup.send(
+                embed=error_embed(
+                    "Queue da day.",
+                    f"Gioi han hien tai la {MAX_QUEUE_SIZE} bai.",
+                ),
+                ephemeral=True,
+            )
+            return True
+
+        if added_count <= 0:
+            await interaction.followup.send(
+                embed=error_embed("Khong them duoc bai nao tu playlist."),
+                ephemeral=True,
+            )
+            return True
+
+        state = self.player.get_state(interaction.guild.id)
+        if was_idle and state.player_message_id is None:
+            await self._send_player_message_from_interaction(interaction)
+        else:
+            await self._refresh_or_create_player_message(interaction.guild.id)
+
+        mode_text = "vao dau queue" if play_next and not was_idle else "vao queue"
+        description = f"Da them **{added_count}** bai {mode_text}."
+        if added_count == limit and available_slots < PLAYLIST_ADD_LIMIT:
+            description += f"\nQueue chi con **{available_slots}** slot."
+        elif added_count == PLAYLIST_ADD_LIMIT:
+            description += f"\nDa dat gioi han **{PLAYLIST_ADD_LIMIT}** bai moi lan them playlist."
+
+        await interaction.followup.send(
+            embed=success_embed("Da them playlist.", description),
+            ephemeral=True,
+        )
+        return True
+
     @app_commands.command(name="play", description="Phat nhac tu YouTube link hoac tu khoa")
     @app_commands.describe(query="YouTube link hoac tu khoa can tim")
     async def play(self, interaction: discord.Interaction, query: str) -> None:
@@ -535,6 +731,9 @@ class MusicCog(commands.Cog):
                 ),
                 ephemeral=True,
             )
+            return
+
+        if await self._handle_playlist_play(interaction, query, play_next=False):
             return
 
         state = self.player.get_state(interaction.guild.id)
@@ -645,6 +844,9 @@ class MusicCog(commands.Cog):
             )
             return
 
+        if await self._handle_playlist_play(interaction, query, play_next=True):
+            return
+
         track = await self.youtube.search(query)
         if track is None:
             await interaction.followup.send(
@@ -713,6 +915,56 @@ class MusicCog(commands.Cog):
             ephemeral=True,
         )
         await self._refresh_or_create_player_message(interaction.guild.id)
+
+    @app_commands.command(name="search", description="Tim nhac YouTube va chon bang menu")
+    @app_commands.describe(query="Tu khoa can tim")
+    async def search(self, interaction: discord.Interaction, query: str) -> None:
+        if interaction.guild is None:
+            await self._send_guild_only_error(interaction)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.followup.send(
+                embed=error_embed("Khong xac dinh duoc thanh vien trong server."),
+                ephemeral=True,
+            )
+            return
+
+        query = query.strip()
+        if not query:
+            await interaction.followup.send(
+                embed=error_embed("Hay nhap tu khoa can tim."),
+                ephemeral=True,
+            )
+            return
+
+        tracks = await self.youtube.search_many(query, limit=SEARCH_RESULT_LIMIT)
+        if not tracks:
+            await interaction.followup.send(
+                embed=error_embed(
+                    "Khong tim thay ket qua.",
+                    "Thu tu khoa khac hoac dung link YouTube truc tiep.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        embed = self.build_search_embed(query, tracks)
+        view = self._create_search_view(
+            interaction.guild.id,
+            interaction.user.id,
+            tracks,
+        )
+        message = await interaction.followup.send(
+            embed=embed,
+            view=view,
+            ephemeral=True,
+            wait=True,
+        )
+        if hasattr(view, "message"):
+            view.message = message
 
     @app_commands.command(name="skip", description="Bo qua bai hien tai")
     async def skip(self, interaction: discord.Interaction) -> None:
